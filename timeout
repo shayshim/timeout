@@ -1,0 +1,314 @@
+#!/usr/bin/perl
+
+# Based on GNU timeout from coreutils.
+# Ported to Perl for easier maintanace of multiple Unix platforms (such as FreeBSD 32/64, Linux 32/64). 
+
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details <http://www.gnu.org/licenses/>.
+
+# greps home <https://sourceforge.net/projects/timeout-perl-impl/>
+
+use strict;
+use warnings;
+use POSIX;
+use Config;
+use Errno;
+use File::Basename;
+use Getopt::Long qw(:config gnu_getopt no_ignore_case require_order);
+
+my $script_name = scalar fileparse($0, qr/\.[^.]*/);
+my @sig_names = split ' ', $Config{sig_name};
+my %sig_nums;
+@sig_nums{@sig_names} = split ' ', $Config{sig_num};
+my $monitored_pid = 0;
+my $timed_out = 0;
+my $interval_between_signals = 1;
+my @signals = (POSIX::SIGTERM);
+my $signals_index = 0;
+my $kill_after = 0;
+my $EXIT_FAILURE = 1;
+my $EXIT_TIMEDOUT = 124; # Time expired before child completed.
+my $EXIT_CANCELED = 125; # Internal error prior to exec attempt.
+my $EXIT_CANNOT_INVOKE = 126; # Program located, but not usable.
+my $EXIT_ENOENT = 127; # Could not find program to exec.
+my $debug = 0;
+my @sig2msg = ("", "Hangup", "Interrupt", "Quit", "Illegal instruction", "Trace/breakpoint trap", "Aborted", "Bus error", "Floating point exception", "Killed", "User defined signal 1", "Segmentation fault", "User defined signal 2", "Broken pipe", "Alarm clock", "Terminated", "Stack fault");
+
+sub error
+{
+    print STDERR "$script_name: @_";
+    print STDERR ": $!" if (defined $! && "$!" ne "");
+    print STDERR "\n";
+}
+
+sub usage
+{
+    my $msg = 
+"Usage: timeout [OPTION] DURATION COMMAND [ARG]...
+ or:  timeout [OPTION]
+Start COMMAND, and kill it if still running after DURATION.
+
+Mandatory arguments to long options are mandatory for short options too.
+  -k, --kill-after=DURATION
+                   also send a KILL signal if COMMAND is still running
+                   this long after the initial signal was sent.
+  -s, --signal=SIGNAL
+                   specify the signal to be sent on timeout.
+                   SIGNAL may be a name like `HUP' or a number.
+                   SIGNAL also may be a sequence of multiple signals 
+                   separated by commas (i.e -s HUP,2,TERM).
+                   See `kill -l` for a list of signals
+  -i, --interval-between-signals=INTERVAL
+                   if multiple signals are specified then INTERVAL
+                   is the seconds to wait between the kills.
+                   Note that the last kill is not bounded by 
+                   INTERVAL (you may use '-k'). Default is 1.
+      --help     display this help and exit
+      --version  output version information and exit
+
+DURATION is an integer with an optional suffix:
+`s' for seconds(the default), `m' for minutes, `h' for hours or `d' for days.
+
+If the command times out, then exit with status $EXIT_TIMEDOUT.  Otherwise, exit
+with the status of COMMAND.  If no signal is specified, send the TERM
+signal upon timeout.  The TERM signal kills any process that does not
+block or catch that signal.  For other processes, it may be necessary to
+use the KILL (9) signal, since this signal cannot be caught.\n";
+    if (defined $_[0])
+    {
+        print STDERR "$msg";
+        exit $_[0];
+    }
+    else
+    {
+        print STDOUT "$msg";
+    }
+}
+
+# Options handler
+sub term_signal_handler
+{
+    my ($opt, $signals_str) = @_;
+    $signals_str =~ s/,/ /g;
+    @signals = split / /, $signals_str;
+    my $index = 0;
+    foreach my $sig(@signals)
+    {
+        if ($sig =~ m/^\d+$/)
+        {
+            if ((! defined $sig_names[$sig])  ||  $sig_names[$sig] =~ m/^NUM\d\d$/)
+            {
+                try_help("$sig: invalid signal");
+            }
+        }
+        else
+        {
+            if (! defined $sig_nums{$sig})
+            {
+                try_help("$sig: invalid signal");
+            }
+            else
+            {
+                $signals[$index] = $sig_nums{$sig};
+            }
+        }
+        $index++;
+    }
+}
+
+# Options handler
+sub version_handler
+{
+
+}
+
+sub try_help
+{
+    print STDERR "$script_name: @_\n" if defined $_[0];
+    print STDERR "Try `$script_name --help' for more information.\n"; 
+    exit $EXIT_CANCELED; 
+}
+
+$SIG{__WARN__} = 
+sub 
+{
+    my $msg=lcfirst "@_"; 
+    if ("@_" =~ "^Unknown option: " || "@_" =~ "^Value \".*\" invalid for option")
+    {
+        $msg=substr $msg, 0, length($msg) - 1; 
+        try_help($msg);
+    }
+};
+
+GetOptions(
+    'kill-after|k=i' => \$kill_after,
+    'interval-between-signals|i=i' => \$interval_between_signals,
+    'signal|s=s' => \&term_signal_handler,
+    'help'     => \&usage,
+    'version' => \&version_handler
+) or usage() && exit $EXIT_CANCELED;
+
+sub cleanup
+{
+    my $sig = shift;
+    $debug && print "$script_name: cleanup($sig)\n";
+	if ($monitored_pid)
+    {
+        my $realarm_time = 0;
+        if ($sig == POSIX::SIGALRM)
+        {
+            $timed_out++; 
+            if ($signals_index < scalar @signals)
+            {
+                $sig = $signals[$signals_index];
+                $realarm_time = $interval_between_signals if ((scalar @signals - $signals_index) > 1);
+                if (($signals_index+1  == scalar @signals) && ($kill_after > 0))
+                {
+                    $realarm_time = $kill_after;
+                    $signals_index++; # sign that next time we send KILL
+                }
+                $signals_index++;
+            }
+            elsif ($signals_index > scalar @signals)
+            {
+                $sig = POSIX::SIGKILL;
+            }
+        }
+        $debug && print "kill($sig, $monitored_pid)\n";
+        kill $sig, -$monitored_pid; #or die "kill: $!"; 
+        if ($realarm_time)
+        {
+            # Start a new timeout after which we'll send SIGKILL.
+            alarm ($realarm_time);
+            $debug && print "$script_name: cleanup($sig): realarmed with $realarm_time\n";
+        }
+    }
+    else 
+    {
+        # We're the child or the child is not exec'd yet.
+        $debug && print "$script_name: cleanup($sig): _exiting...\n";
+        POSIX::_exit (128 + $sig);
+    }
+}
+
+sub get_in_seconds
+{
+    my ($time,$unit) = @_;
+    if ($unit)
+    {
+        $time =~ s/.$//;
+        if ($unit eq "m")
+        {
+            return $time*60;
+        }
+        elsif ($unit eq "h")
+        {
+            return $time*60*60;
+        }
+        elsif ($unit eq "d")
+        {
+            return $time*60*60*24;
+        }
+    }
+    return $time;
+}
+
+try_help() if (length "@ARGV" == 0);
+my $time = shift @ARGV;
+try_help("invalid duration: $time") if ($time !~ m/^\d+([smhd]?)$/);
+
+$time = get_in_seconds($time,$1);
+$debug && print "$script_name: time=$time\n";
+
+local $SIG {ALRM} = sub { cleanup(POSIX::SIGALRM); }; 
+local $SIG {INT} = sub { cleanup(POSIX::SIGINT); }; 
+local $SIG {QUIT} = sub { cleanup(POSIX::SIGQUIT); }; 
+local $SIG {HUP} = sub { cleanup(POSIX::SIGHUP); }; 
+local $SIG {TERM} = sub { cleanup(POSIX::SIGTERM); }; 
+local $SIG {TTIN} = 'IGNORE'; # Don't sTop if background child needs tty.
+local $SIG {TTOU} = 'IGNORE'; # Don't sTop if background child needs tty.
+local $SIG {CHLD} = 'DEFAULT'; # Don't inherit CHLD handling from parent.
+
+for (my $i=0; $i<scalar @signals; $i++)
+{
+    local $SIG {$sig_names[$signals[$i]]} = sub { cleanup($signals[$i]); };
+}
+
+eval 
+{
+    $monitored_pid = fork;
+
+    if (! defined $monitored_pid)
+    {
+        error ("fork system call failed");
+        exit $EXIT_CANCELED;
+    }
+
+	unless ($monitored_pid) 
+    {
+		# Child
+        POSIX::setpgid (0, 0);
+        local $SIG {ALRM} = 'DEFAULT'; 
+        local $SIG {INT} = 'DEFAULT'; 
+        local $SIG {QUIT} = 'DEFAULT'; 
+        local $SIG {HUP} = 'DEFAULT'; 
+        local $SIG {TERM} = 'DEFAULT'; 
+        local $SIG {TTIN} = 'DEFAULT';
+        local $SIG {TTOU} = 'DEFAULT';
+        for (my $i=0; $i<scalar @signals; $i++)
+        {
+            local $SIG {$sig_names[$signals[$i]]} = 'DEFAULT';
+        }        
+
+        {
+            exec (@ARGV);
+        }
+        
+        # Exit like sh, env, nohup, ... 
+        my $child_status = (($!{ENOENT})? $EXIT_ENOENT : $EXIT_CANNOT_INVOKE);
+        error ("failed to run command \'$ARGV[0]\'");
+        exit $child_status;
+	}
+    
+    POSIX::setpgid ($monitored_pid, $monitored_pid);
+	alarm $time;
+	wait;
+    my $wait_status = $?;
+    my $status = 0;
+    if ($wait_status == -1)
+    {
+        error ("error waiting for command");
+        $status = $EXIT_CANCELED;
+    }
+    else
+    {
+        if (POSIX::WIFEXITED ($wait_status))
+        {
+            $status = POSIX::WEXITSTATUS ($wait_status);
+        }
+        elsif (POSIX::WIFSIGNALED ($wait_status))
+        {
+            my $sig = POSIX::WTERMSIG ($wait_status);
+            print STDERR "$script_name: $monitored_pid $sig2msg[$sig]      @ARGV\n";
+            $status = $sig + 128;
+        }
+        else
+        {
+            error ("unknown status from command: $wait_status");
+            $status = $EXIT_FAILURE;
+        }
+        exit $EXIT_TIMEDOUT if ($timed_out);
+        exit $status;
+    }
+};
+
+die $@ if $@;
+exit 0;
+
+
