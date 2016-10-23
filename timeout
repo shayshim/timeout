@@ -12,7 +12,7 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU General Public License for more details <http://www.gnu.org/licenses/>.
 
-# greps home <https://sourceforge.net/projects/timeout-perl-impl/>
+# timeout home <https://sourceforge.net/projects/timeout-perl-impl/>
 
 use strict;
 use warnings;
